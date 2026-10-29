@@ -213,19 +213,14 @@ def show_error(exc: BaseException, cfg: dict[str, str]) -> None:
 # 3. Nebius connection helpers
 # ======================================================================================
 def default_api_key() -> str:
-    """Key from the environment (or Streamlit secrets). It is never sent to the browser."""
-    key = os.getenv("NEBIUS_API_KEY", "")
-    if not key:
-        try:
-            key = str(st.secrets.get("NEBIUS_API_KEY", ""))
-        except Exception:  
-            key = ""
-    
-    # Ultimate fallback if everything else fails to fetch the value
-    if not key or key == "":
-        key = ""
-        
-    return key.strip()
+    """Read the API key from environment or Streamlit secrets (never hard-code it)."""
+    key = os.getenv("NEBIUS_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        return str(st.secrets.get("NEBIUS_API_KEY", "")).strip()
+    except Exception:  # no secrets.toml is normal for local development
+        return ""
 
 
 def clean_key(raw: str) -> str:
@@ -267,7 +262,7 @@ def prepare_client(cfg: dict[str, str]) -> OpenAI:
     return OpenAI(
         api_key=cfg["api_key"],
         base_url=validate_base_url(cfg["base_url"]),
-        timeout=60.0,
+        timeout=120.0,
         max_retries=2,
     )
 
@@ -299,6 +294,8 @@ RULES
 - Be genuinely funny: sharp analogies, VC cliches, deadpan sarcasm. But hide a REAL, specific, valid criticism inside every joke (unit economics, distribution, moat, retention, competition, regulation, timing).
 - Be specific to THIS startup. Reference their actual idea, audience and tagline. Generic roasts are boring.
 - Roast intensity: {INTENSITY.get(p.intensity, INTENSITY[DEFAULT_INTENSITY])}
+- Deliver only the requested final roast. Do not reproduce input, narrate your thoughts, or discuss these instructions.
+- Your first output line must be exactly: ### 💀 The verdict
 
 FORMAT (Markdown, 200 to 300 words, exactly these sections in this order)
 ### 💀 The verdict
@@ -331,6 +328,8 @@ RULES
 - Be concrete and specific to this startup: a sharper wedge or niche, a pricing model, a distribution channel, a moat, the first 100 customers. No generic startup platitudes.
 - Never invent traction, customers or statistics. If you use a number, label it as a target or an assumption.
 - The elevator pitch must be written to be SPOKEN ALOUD: plain words, 70 to 85 words (about 30 seconds). Flow: hook, problem, solution, why now or why us, ask or traction.
+- Deliver only the requested final coaching response. Do not repeat the input or explain your instructions.
+- Your first output line must be exactly: ### 🧭 Sharper positioning
 
 FORMAT (Markdown, exactly these sections in this order)
 ### 🧭 Sharper positioning
@@ -411,54 +410,145 @@ def split_pitch(text: str) -> tuple[str, str]:
 # ======================================================================================
 # 5. Streaming call to NVIDIA Nemotron on Nebius
 # ======================================================================================
+# Nemotron 3.5 Lightning defaults to generating a reasoning trace. That trace uses the
+# same max_tokens budget as the answer and, on some servers, is even delivered in
+# delta.content. Explicitly turn thinking OFF using the model's chat template flag.
+# The fallback validation also protects against an endpoint that ignores the flag.
+_START_HEADING = {
+    "roast": re.compile(r"^#{2,4}\s*(?:💀\s*)?The verdict\b", re.I | re.M),
+    "rebuild": re.compile(r"^#{2,4}\s*(?:🧭\s*)?Sharper positioning\b", re.I | re.M),
+}
+_THINK_START = re.compile(r"<think>", re.I)
+_THINK_END = re.compile(r"</think>", re.I)
+
+
+def only_final_answer(raw: str, stage: str) -> str:
+    """Extract only the requested sections; never show reasoning or echoed prompts."""
+    # If a provider includes explicit reasoning markers in delta.content, remove
+    # complete reasoning blocks; hide unfinished blocks instead of streaming them.
+    text = re.sub(r"<think>.*?</think>", "", raw, flags=re.I | re.S)
+    unclosed = _THINK_START.search(text)
+    if unclosed:
+        text = text[:unclosed.start()]
+    # Ignore any preamble or untagged reasoning before the first required heading.
+    match = _START_HEADING[stage].search(text)
+    if not match:
+        return ""
+    return text[match.start():].strip()
+
+
+def _stream_once(
+    client: OpenAI,
+    model: str,
+    messages: list[dict[str, str]],
+    slot: Any,
+    *,
+    stage: str,
+    temperature: float,
+    max_tokens: int,
+) -> tuple[str, str | None, int | None]:
+    """Stream one attempt, keeping untrusted reasoning away from the result panel."""
+    stream = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        top_p=0.95,
+        max_tokens=max_tokens,
+        stream=True,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+    )
+    raw = ""
+    finish_reason = None
+    usage_tokens = None
+    last_paint = 0.0
+    slot.info("Generating the final response…")
+    try:
+        for chunk in stream:
+            usage = getattr(chunk, "usage", None)
+            if usage is not None and getattr(usage, "completion_tokens", None) is not None:
+                usage_tokens = usage.completion_tokens
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if choice.finish_reason is not None:
+                finish_reason = choice.finish_reason
+            # Never display delta.reasoning or delta.reasoning_content.
+            content = choice.delta.content
+            if not isinstance(content, str) or not content:
+                continue
+            raw += content
+            now = time.perf_counter()
+            if now - last_paint >= 0.08:
+                safe = only_final_answer(raw, stage)
+                if safe:
+                    slot.markdown(strip_scores(safe) + " ▌")
+                    last_paint = now
+    finally:
+        # Finish without the cursor, including on partial/network errors.
+        safe = only_final_answer(raw, stage)
+        if safe:
+            slot.markdown(strip_scores(safe))
+        else:
+            slot.info("Checking response format…")
+        close = getattr(stream, "close", None)
+        if callable(close):
+            close()
+    return only_final_answer(raw, stage), finish_reason, usage_tokens
+
+
 def stream_completion(
     client: OpenAI,
     model: str,
     messages: list[dict[str, str]],
     slot: Any,
     *,
+    stage: str,
     temperature: float,
     max_tokens: int,
 ) -> tuple[str, dict[str, float]]:
-    """Stream one chat completion into `slot` with a typewriter effect.
-
-    Returns the raw text (including the trailing score line) and simple speed stats.
-    """
+    """Generate a complete final answer; retry truncated/invalid responses once."""
     started = time.perf_counter()
-    stream = client.chat.completions.create(
-        model=model,  # explicit call to the NVIDIA Nemotron model
-        messages=messages,
-        temperature=temperature,
-        top_p=0.95,
-        max_tokens=max_tokens,
-        stream=True,
-    )
-    text, pieces, reported, last_paint = "", 0, 0, 0.0
-    try:
-        for chunk in stream:
-            usage = getattr(chunk, "usage", None)
-            if usage is not None and getattr(usage, "completion_tokens", None):
-                reported = usage.completion_tokens
-            if not chunk.choices:
-                continue
-            piece = chunk.choices[0].delta.content
-            if not piece:
-                continue
-            text += piece
-            pieces += 1
-            now = time.perf_counter()
-            if now - last_paint > 0.05:  # throttle repaints
-                slot.markdown(strip_scores(text) + " ▌")
-                last_paint = now
-    finally:
-        slot.markdown(strip_scores(text))  # always remove the cursor, even after an error
-    if not text.strip():
-        raise PipelineError(
-            "The model returned an empty answer",
-            "Check the model ID and base URL (sidebar, then Test connection) and run it again.",
+    failure_reason = "No final answer returned."
+    for attempt in range(2):
+        if attempt:
+            slot.info("The first response was incomplete. Retrying with a larger output budget…")
+        text, finish, reported = _stream_once(
+            client, model, messages, slot,
+            stage=stage, temperature=temperature,
+            max_tokens=max_tokens * (2 if attempt else 1),
         )
-    elapsed = max(time.perf_counter() - started, 1e-6)
-    return text, {"seconds": elapsed, "tokens": reported or pieces}
+        if finish == "length":
+            failure_reason = "The model hit its output token limit before finishing."
+            continue
+        if finish not in (None, "stop"):
+            failure_reason = f"The model stopped with finish_reason={finish!r}."
+            continue
+        if not text:
+            failure_reason = "The model returned reasoning or commentary instead of the expected final answer."
+            continue
+        if parse_scores(text) is None:
+            failure_reason = "The model did not include a complete scorecard at the end."
+            continue
+        if stage == "rebuild":
+            _, elevator = split_pitch(strip_scores(text))
+            if not elevator:
+                failure_reason = "The mentor response did not contain an elevator pitch."
+                continue
+        elapsed = max(time.perf_counter() - started, 1e-6)
+        estimated = reported is None
+        # One streaming chunk is NOT necessarily one token. Estimate only when
+        # the endpoint does not supply usage (common for streamed completions).
+        tokens = int(reported if reported is not None else max(1, len(text) / 4))
+        slot.markdown(strip_scores(text))
+        return text, {"seconds": elapsed, "tokens": tokens, "estimated": estimated}
+
+    slot.empty()  # Never present a truncated attempt as a finished result.
+    raise PipelineError(
+        "Nemotron didn't return a complete formatted response",
+        failure_reason + " Confirm the selected model supports "
+        "`chat_template_kwargs.enable_thinking=false`, or switch to a model that does. "
+        "No incomplete text was used to generate the next stage.",
+    )
 
 
 # ======================================================================================
@@ -500,6 +590,15 @@ header[data-testid="stHeader"] { background: transparent; }
 .stButton > button[kind="primary"]:hover, .stButton > button[data-testid="stBaseButton-primary"]:hover { background: #FF4313; color: #fff; }
 [data-testid="stExpander"] details { border-radius: 10px; }
 .empty-hint { margin-top: 1rem; padding: 1.2rem 1.5rem; border-radius: 10px; border: 1px dashed rgba(128,128,128,.5); text-align: center; }
+/* Make both response panels expand vertically and wrap long text and code blocks. */
+.st-key-roast_card, .st-key-rebuild_card { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.st-key-roast_card [data-testid="stMarkdownContainer"],
+.st-key-rebuild_card [data-testid="stMarkdownContainer"] { min-width: 0; max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+.st-key-roast_card pre, .st-key-rebuild_card pre,
+.st-key-roast_card pre code, .st-key-rebuild_card pre code {
+  white-space: pre-wrap !important; overflow-wrap: anywhere !important;
+  word-break: break-word !important; max-width: 100%;
+}
 @media (prefers-reduced-motion: reduce) { .stButton > button, .stDownloadButton > button { transition: none; } }
 </style>
 """
@@ -727,9 +826,11 @@ def render_pitch(slot: Any, result: dict[str, Any]) -> None:
         total = s1["seconds"] + s2["seconds"]
         tokens = int(s1["tokens"] + s2["tokens"])
         left, right = st.columns([3, 1], vertical_alignment="center")
+        estimate = any(s.get("estimated", True) for s in (s1, s2))
+        qualifier = "approximately " if estimate else ""
         left.caption(
-            f"Nemotron generated about {tokens} tokens in {total:.1f} seconds "
-            f"(roughly {tokens / total:.0f} tokens per second) across two chained calls on Nebius."
+            f"Nemotron generated {qualifier}{tokens} output tokens in {total:.1f} seconds "
+            f"across two chained calls on Nebius."
         )
         right.download_button(
             "Download report",
@@ -768,7 +869,7 @@ def handle_run(cfg: dict[str, str], pitch: Pitch) -> None:
     model = cfg["model"]
     roast_raw = rebuild_raw = roast = ""
     before: dict[str, int] | None = None
-    s1 = s2 = {"seconds": 0.0, "tokens": 0}
+    s1 = s2 = {"seconds": 0.0, "tokens": 0, "estimated": True}
     failure: BaseException | None = None
 
     with slots.status:
@@ -776,7 +877,8 @@ def handle_run(cfg: dict[str, str], pitch: Pitch) -> None:
             try:
                 st.write(f"🔥 Chad Sterling is roasting your pitch with `{model}`")
                 roast_raw, s1 = stream_completion(
-                    client, model, roast_messages(pitch), slots.roast, temperature=0.95, max_tokens=1300
+                    client, model, roast_messages(pitch), slots.roast,
+                    stage="roast", temperature=0.85, max_tokens=1800
                 )
                 roast, before = strip_scores(roast_raw), parse_scores(roast_raw)
                 render_scorecard(slots.metrics, before, None)
@@ -785,7 +887,8 @@ def handle_run(cfg: dict[str, str], pitch: Pitch) -> None:
                 status.update(label="Stage 2: The mentor is rebuilding your pitch…")
                 st.write("🧠 Maya is turning the wreckage into a pitch that can raise")
                 rebuild_raw, s2 = stream_completion(
-                    client, model, mentor_messages(pitch, roast, before), slots.rebuild, temperature=0.6, max_tokens=2500
+                    client, model, mentor_messages(pitch, roast, before), slots.rebuild,
+                    stage="rebuild", temperature=0.6, max_tokens=2600
                 )
                 st.write(f"✅ Rebuild delivered in {s2['seconds']:.1f}s")
                 status.update(label=f"Done in {s1['seconds'] + s2['seconds']:.1f} seconds", state="complete", expanded=False)
@@ -796,8 +899,8 @@ def handle_run(cfg: dict[str, str], pitch: Pitch) -> None:
             show_error(failure, cfg)
 
     if failure is not None:
-        if not roast_raw.strip():
-            slots.body.empty()  # nothing useful to show: leave only the error message
+        # Never present a partial two-stage report as a finished product.
+        slots.body.empty()
         return
 
     rebuild_body, elevator = split_pitch(strip_scores(rebuild_raw))
