@@ -776,7 +776,7 @@ def handle_run(cfg: dict[str, str], pitch: Pitch) -> None:
             try:
                 st.write(f"🔥 Chad Sterling is roasting your pitch with `{model}`")
                 roast_raw, s1 = stream_completion(
-                    client, model, roast_messages(pitch), slots.roast, temperature=0.95, max_tokens=900
+                    client, model, roast_messages(pitch), slots.roast, temperature=0.95, max_tokens=1300
                 )
                 roast, before = strip_scores(roast_raw), parse_scores(roast_raw)
                 render_scorecard(slots.metrics, before, None)
@@ -785,7 +785,7 @@ def handle_run(cfg: dict[str, str], pitch: Pitch) -> None:
                 status.update(label="Stage 2: The mentor is rebuilding your pitch…")
                 st.write("🧠 Maya is turning the wreckage into a pitch that can raise")
                 rebuild_raw, s2 = stream_completion(
-                    client, model, mentor_messages(pitch, roast, before), slots.rebuild, temperature=0.6, max_tokens=1300
+                    client, model, mentor_messages(pitch, roast, before), slots.rebuild, temperature=0.6, max_tokens=2500
                 )
                 st.write(f"✅ Rebuild delivered in {s2['seconds']:.1f}s")
                 status.update(label=f"Done in {s1['seconds'] + s2['seconds']:.1f} seconds", state="complete", expanded=False)
